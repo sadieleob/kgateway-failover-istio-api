@@ -33,7 +33,43 @@ The basic DestinationRule-only approach (locality failover on a single Kubernete
                       (runs in us-west-2)
 ```
 
-Envoy assigns **priority 0** to endpoints matching the proxy's region and **priority 1** to remote endpoints. When the P0 endpoint is ejected via outlier detection, traffic overflows to P1.
+## How Priority is Assigned
+
+Priority is **not manually configured** anywhere in the YAML. It is automatically derived at translation time by comparing the **proxy's node topology labels** against each **endpoint's declared locality**.
+
+When `failoverPriority` is set (e.g., `["topology.kubernetes.io/region"]`), kgateway compares the value of each listed label on the proxy's node against the corresponding value on each endpoint. If all labels match, the endpoint gets **priority 0** (highest preference). Each label mismatch increases the priority number (lower preference).
+
+In this demo, the proxy runs on a node labeled `topology.kubernetes.io/region: us-west-2`. With `failoverPriority: ["topology.kubernetes.io/region"]`:
+
+| Endpoint | Endpoint locality | Region match with proxy? | Assigned priority |
+|---|---|---|---|
+| backend-west2 | `us-west-2/us-west-2a` | Yes | **0** (preferred) |
+| backend-east1 | `us-east-1/us-east-1a` | No | **1** (failover) |
+
+### Multiple failoverPriority labels
+
+You can specify multiple labels for finer-grained priority tiers. For example, with `failoverPriority: ["topology.kubernetes.io/region", "topology.kubernetes.io/zone"]`:
+
+| Match | Priority |
+|---|---|
+| region + zone match | 0 |
+| region matches, zone differs | 1 |
+| region differs | 2 |
+
+### Without failoverPriority
+
+If `failoverPriority` is not set but locality failover is configured via the `failover` field, kgateway falls back to direct locality comparison:
+
+| Match | Priority |
+|---|---|
+| region + zone + subzone match | 0 |
+| region + zone match | 1 |
+| region match | 2 |
+| no match | 3 |
+
+### Key takeaway
+
+No manual priority assignment is needed. Deploy the proxy in the desired "primary" region, declare each endpoint's locality in the ServiceEntry, and the priority hierarchy is computed automatically. When the P0 endpoint is ejected via outlier detection, Envoy overflows traffic to P1.
 
 ## Prerequisites
 
