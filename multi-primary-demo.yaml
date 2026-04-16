@@ -1,0 +1,286 @@
+###############################################################################
+# Multiple Primaries + Failover Demo
+#
+# Extends the basic failover demo to show multiple primary endpoints sharing
+# the same locality. Envoy round-robins across all P0 endpoints and fails
+# over to P1 only after ALL primaries are ejected.
+#
+# Architecture:
+#   backend-west2   svc (us-west-2) --> nginx-primary   pods (PRIMARY-A)
+#   backend-west2-b svc (us-west-2) --> nginx-primary-b pods (PRIMARY-B)
+#   backend-east1   svc (us-east-1) --> nginx-failover  pods (FAILOVER)
+#
+#   ServiceEntry aggregates all three under one abstract hostname.
+#   Two endpoints share us-west-2 locality (both P0), one is us-east-1 (P1).
+###############################################################################
+
+# --- ConfigMaps for distinct nginx responses ---
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-primary-html
+  namespace: failover-demo
+data:
+  index.html: |
+    You hit PRIMARY-A (v1)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-primary-b-html
+  namespace: failover-demo
+data:
+  index.html: |
+    You hit PRIMARY-B (v1b)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-failover-html
+  namespace: failover-demo
+data:
+  index.html: |
+    You hit FAILOVER (v2)
+
+# --- Primary-A Deployment (v1) - 2 replicas in us-west-2 ---
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-primary
+  namespace: failover-demo
+  labels:
+    app: nginx-failover
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx-failover
+      version: v1
+  template:
+    metadata:
+      labels:
+        app: nginx-failover
+        version: v1
+    spec:
+      nodeSelector:
+        topology.kubernetes.io/region: us-west-2
+      containers:
+      - name: nginx
+        image: nginx
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: html-volume
+          mountPath: /usr/share/nginx/html
+      volumes:
+      - name: html-volume
+        configMap:
+          name: nginx-primary-html
+
+# --- Primary-B Deployment (v1b) - 1 replica in us-west-2 ---
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-primary-b
+  namespace: failover-demo
+  labels:
+    app: nginx-failover
+    version: v1b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx-failover
+      version: v1b
+  template:
+    metadata:
+      labels:
+        app: nginx-failover
+        version: v1b
+    spec:
+      nodeSelector:
+        topology.kubernetes.io/region: us-west-2
+      containers:
+      - name: nginx
+        image: nginx
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: html-volume
+          mountPath: /usr/share/nginx/html
+      volumes:
+      - name: html-volume
+        configMap:
+          name: nginx-primary-b-html
+
+# --- Failover Deployment (v2) - 1 replica in us-east-1 ---
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-failover
+  namespace: failover-demo
+  labels:
+    app: nginx-failover
+    version: v2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx-failover
+      version: v2
+  template:
+    metadata:
+      labels:
+        app: nginx-failover
+        version: v2
+    spec:
+      nodeSelector:
+        topology.kubernetes.io/region: us-east-1
+      containers:
+      - name: nginx
+        image: nginx
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: html-volume
+          mountPath: /usr/share/nginx/html
+      volumes:
+      - name: html-volume
+        configMap:
+          name: nginx-failover-html
+
+# --- Services ---
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-west2
+  namespace: failover-demo
+spec:
+  selector:
+    app: nginx-failover
+    version: v1
+  ports:
+  - port: 80
+    targetPort: 80
+    protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-west2-b
+  namespace: failover-demo
+spec:
+  selector:
+    app: nginx-failover
+    version: v1b
+  ports:
+  - port: 80
+    targetPort: 80
+    protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-east1
+  namespace: failover-demo
+spec:
+  selector:
+    app: nginx-failover
+    version: v2
+  ports:
+  - port: 80
+    targetPort: 80
+    protocol: TCP
+
+# --- ServiceEntry: 2 primary endpoints + 1 failover ---
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: multi-region-backend
+  namespace: failover-demo
+spec:
+  hosts:
+  - multi-region-backend.internal
+  ports:
+  - number: 80
+    name: http
+    protocol: HTTP
+  resolution: DNS
+  location: MESH_INTERNAL
+  endpoints:
+  - address: backend-west2.failover-demo.svc.cluster.local
+    locality: us-west-2/us-west-2a
+    ports:
+      http: 80
+  - address: backend-west2-b.failover-demo.svc.cluster.local
+    locality: us-west-2/us-west-2a
+    ports:
+      http: 80
+  - address: backend-east1.failover-demo.svc.cluster.local
+    locality: us-east-1/us-east-1a
+    ports:
+      http: 80
+
+# --- DestinationRule ---
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: multi-region-backend-dr
+  namespace: failover-demo
+spec:
+  host: multi-region-backend.internal
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 100
+    loadBalancer:
+      localityLbSetting:
+        failoverPriority:
+        - "topology.kubernetes.io/region"
+
+# --- Gateway ---
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: failover-demo-gw
+  namespace: kgateway-system
+spec:
+  gatewayClassName: enterprise-kgateway
+  listeners:
+  - name: http
+    port: 8080
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: All
+
+# --- HTTPRoute ---
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: se-failover-route
+  namespace: failover-demo
+spec:
+  parentRefs:
+  - name: failover-demo-gw
+    namespace: kgateway-system
+  hostnames:
+  - "se-failover.example.com"
+  rules:
+  - backendRefs:
+    - name: multi-region-backend.internal
+      port: 80
+      kind: Hostname
+      group: networking.istio.io

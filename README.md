@@ -243,7 +243,74 @@ Without it, the default is 10%. If you have only 1 endpoint per priority level, 
 }
 ```
 
+## Multiple Primaries
+
+Multiple endpoints can share the same locality as the proxy, making them all **P0 (primary)**. Envoy round-robins across all P0 endpoints. Failover to P1 only triggers after **all** primaries are ejected via outlier detection.
+
+### Architecture
+
+```
+                      ServiceEntry
+                 "multi-region-backend.internal"
+                ┌────────────────────────────────┐
+                │                                │
+                │  endpoint 1 (P0)               │──→ backend-west2   (us-west-2) ── PRIMARY-A
+                │  locality: us-west-2/us-west-2a│
+                │                                │
+                │  endpoint 2 (P0)               │──→ backend-west2-b (us-west-2) ── PRIMARY-B
+                │  locality: us-west-2/us-west-2a│
+                │                                │
+                │  endpoint 3 (P1)               │──→ backend-east1   (us-east-1) ── FAILOVER
+                │  locality: us-east-1/us-east-1a│
+                └────────────────────────────────┘
+```
+
+Both PRIMARY-A and PRIMARY-B share the proxy's locality (`us-west-2`), so they both get **priority 0**. Envoy distributes traffic across them evenly. The FAILOVER endpoint in `us-east-1` gets **priority 1** and only receives traffic after both primaries are ejected.
+
+### Deploy the multi-primary demo
+
+```bash
+kubectl create ns failover-demo
+kubectl apply -f multi-primary-demo.yaml
+```
+
+### Test round-robin across primaries
+
+```bash
+GW_IP=$(kubectl get gateway failover-demo-gw -n kgateway-system -o jsonpath='{.status.addresses[0].value}')
+for i in $(seq 1 10); do curl -s -H "host: se-failover.example.com" http://$GW_IP:8080/; done
+# Output alternates between PRIMARY-A and PRIMARY-B
+```
+
+### Simulate full regional failure
+
+```bash
+kubectl -n failover-demo scale deployment nginx-primary --replicas=0
+kubectl -n failover-demo scale deployment nginx-primary-b --replicas=0
+# Wait a few seconds, then send requests with 1s delay
+for i in $(seq 1 10); do
+  curl -s -H "host: se-failover.example.com" --max-time 3 http://$GW_IP:8080/
+  sleep 1
+done
+# First 5-6 requests fail (both P0 endpoints must hit the ejection threshold), then FAILOVER
+```
+
+> **Note:** With two primary endpoints, more initial failures are expected before failover kicks in compared to the single-primary case. Each P0 endpoint must independently reach the `consecutive5xxErrors` threshold (3) before being ejected. Envoy may alternate between the two unhealthy primaries before both are ejected.
+
+### Restore primaries
+
+```bash
+kubectl -n failover-demo scale deployment nginx-primary --replicas=2
+kubectl -n failover-demo scale deployment nginx-primary-b --replicas=1
+# Wait 30s+ for ejection timer to expire
+sleep 35
+for i in $(seq 1 10); do curl -s -H "host: se-failover.example.com" http://$GW_IP:8080/; done
+# Traffic returns to PRIMARY-A and PRIMARY-B
+```
+
 ## Test Results
+
+### Single Primary + Failover (`failover-demo-full.yaml`)
 
 | Scenario | Expected | Result |
 |----------|----------|--------|
@@ -251,9 +318,18 @@ Without it, the default is 10%. If you have only 1 endpoint per priority level, 
 | Primary scaled to 0 | FAILOVER after ejection | 3 failures, then FAILOVER 4/4 |
 | Primary restored + ejection expired | PRIMARY | PRIMARY 5/5 |
 
+### Multiple Primaries + Failover (`multi-primary-demo.yaml`)
+
+| Scenario | Expected | Result |
+|----------|----------|--------|
+| Normal traffic | Round-robin PRIMARY-A + PRIMARY-B | Both hit, ~50/50 split across 10 requests |
+| Both primaries scaled to 0 | FAILOVER after ejection | 5-6 failures, then FAILOVER 4/4 |
+| Both primaries restored + ejection expired | Round-robin PRIMARY-A + PRIMARY-B | Both hit across 10 requests |
+
 ## Limitations
 
 This workaround provides basic locality-based failover. It does **not** support:
+- Weight-based distribution between primaries (e.g., 10%/90%) — `localityLbSetting.distribute` is not implemented in kgateway
 - Header-based failover triggers (e.g., `X-routeDecision: SWITCH`)
 - Custom retry categories (ONE vs MULTIPLE sequential targets)
 - Arbitrary N-hop failover chains (priority is derived from locality hierarchy)
