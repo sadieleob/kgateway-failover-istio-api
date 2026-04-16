@@ -67,6 +67,16 @@ If `failoverPriority` is not set but locality failover is configured via the `fa
 | region match | 2 |
 | no match | 3 |
 
+### When no endpoints match the proxy's locality
+
+When none of the ServiceEntry endpoints share a locality with the proxy, they all get the **same priority** and Envoy **round-robins across all of them equally** — no failover hierarchy, just load balancing. The proxy must be in a locality that matches at least one endpoint for priority-based failover to kick in.
+
+| Scenario | Behavior |
+|---|---|
+| Proxy locality matches one endpoint | That endpoint = P0 (preferred), others = P1+ (failover) |
+| Proxy locality matches no endpoints | All endpoints share the same priority, round-robin across all |
+| Proxy locality matches multiple endpoints | Those endpoints share P0, non-matching get P1+ |
+
 ### Key takeaway
 
 No manual priority assignment is needed. Deploy the proxy in the desired "primary" region, declare each endpoint's locality in the ServiceEntry, and the priority hierarchy is computed automatically. When the P0 endpoint is ejected via outlier detection, Envoy overflows traffic to P1.
